@@ -4,8 +4,11 @@ This small AI package predicts SPX Close data from a PyTorch transformer model.
 
 
 This package is predict-only.  The bundled checkpoint contains the model
-weights and the trading-date index through `2026-05-29`.
-Before 12/30/1927, the data is rescaled from the Industrial close since 5/26/1896.
+weights and the trading-date index through `5/29/2026`.
+Before `12/30/1927`, the data is rescaled from the Industrial close since `5/26/1896`.
+
+Disclaimer: There is no guarrantee of data precision since the AI model is prone to error. Use with your own risk.
+
 
 ## Install
 
@@ -87,8 +90,7 @@ chat-spx --range 2026-05-18 2026-05-21
 - `predict(date)` returns the date id, predicted digits, fixed integer, `log_px`,
   and `px`.
 - The date must be in the frozen trading-date index.  Weekends, holidays,
-  and dates after the frozen checkpoint range raise `KeyError`.
-- The model is an obfuscation container for memorized values, not a forecaster.
+  and dates after `5/29/2026` raise `KeyError`.
 
 ## Tests
 

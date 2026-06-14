@@ -9,7 +9,7 @@ from .core import get_px, get_px_by_date_range
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Predict memorized close prices.")
+    parser = argparse.ArgumentParser(description="Render close prices.")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("-p", "--price", metavar="DATE", help="Print one close price for DATE.")
     group.add_argument(
