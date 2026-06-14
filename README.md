@@ -1,13 +1,12 @@
 # chat-spx
 
-This small AI package predicts SPX Close data from a PyTorch transformer model.
+This small AI package is a chat engine. You send it a date, it tells you the SPX Close on that date.
 
+This package is based on a PyTorch transformer model and is predict-only.
+The bundled data contains the model weights and the trading-date index from `5/26/1896` to `5/29/2026`.
+Before `12/30/1927`, the training data is rescaled from the Industrial close.
 
-This package is predict-only.  The bundled checkpoint contains the model
-weights and the trading-date index through `5/29/2026`.
-Before `12/30/1927`, the data is rescaled from the Industrial close since `5/26/1896`.
-
-Disclaimer: There is no guarrantee of data precision since the AI model is prone to error. Use with your own risk.
+Disclaimer: There is no guarantee of data precision since the AI model is prone to error. Use at your own risk.
 
 
 ## Install
