@@ -1,0 +1,4 @@
+include README.md
+include LICENSE
+recursive-include src/chat_spx/data *.pt
+include src/chat_spx/py.typed
