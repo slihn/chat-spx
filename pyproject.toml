@@ -34,6 +34,11 @@ test = [
     "pytest>=7"
 ]
 
+[project.urls]
+Homepage = "https://github.com/slihn/chat-spx"
+Repository = "https://github.com/slihn/chat-spx"
+Issues = "https://github.com/slihn/chat-spx/issues"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

@@ -23,6 +23,11 @@ setup(
     install_requires=["torch>=2.0"],
     extras_require={"test": ["pytest>=7"]},
     entry_points={"console_scripts": ["chat-spx=chat_spx.__main__:main"]},
+    project_urls={
+        "Homepage": "https://github.com/slihn/chat-spx",
+        "Repository": "https://github.com/slihn/chat-spx",
+        "Issues": "https://github.com/slihn/chat-spx/issues",
+    },
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
