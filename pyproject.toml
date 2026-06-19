@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chat-spx"
-version = "0.1.0"
+version = "0.2.0"
 description = "Close prices memorized in a transformer checkpoint"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -1,8 +1,9 @@
 """Predict-only transformer memory for frozen close data.
 
 The package ships the trained checkpoint produced by the notebook.  Runtime
-inference only needs the transformer architecture, the frozen date index stored
-inside the checkpoint, and arithmetic to turn predicted digits back into log_px.
+inference only needs the transformer architecture, the checkpoint weights, and
+arithmetic to turn predicted digits back into log_px.  The trading-date index is
+reconstructed from the checkpoint by querying the memorized D and M prefixes.
 """
 
 from __future__ import annotations
@@ -18,24 +19,28 @@ import torch.nn as nn
 
 MODEL_DTYPE = torch.float32
 LOG_PX_SCALE = 10_000_000_000
-Y_SCALE = 1_000_000
 FIXED_DIGITS = 11
 FIXED_PLACE_VALUES = tuple(10**power for power in range(FIXED_DIGITS - 1, -1, -1))
 DEFAULT_CHECKPOINT_NAME = "mem_digit.pt"
 RANGE_BATCH_SIZE = 2048
 
+PRICE_PREFIX = "P"
+DATE_PREFIX = "D"
+MAX_DATE_ID_PREFIX = "M"
+PREFIX_TO_ID = {PRICE_PREFIX: 0, DATE_PREFIX: 1, MAX_DATE_ID_PREFIX: 2}
+
 _CHATPX_CACHE: dict[str, "ChatPX"] = {}
 
 
 class DateTransformerDigitMemorizer(nn.Module):
-    """Transformer encoder that memorizes fixed-point log_px digits by date.
+    """Transformer encoder that memorizes digit outputs by prefix and date_id.
 
-    Input tokens are date_id, shifted year, month, and day.  The output is 11
-    ten-way digit logits for the fixed-point integer round(log_px * 1e10).
+    Input rows are [prefix_id, date_id].  P returns log_px_fixed digits, D
+    returns YYYYMMDD digits, and M with date_id 0 returns max(date_id).
     """
 
-    def __init__(self, min_year, max_year, num_dates, d_model=256, nhead=8, num_layers=4, dropout=0.0):
-        """Build date-part embeddings, transformer layers, and digit heads.
+    def __init__(self, num_dates, d_model=144, nhead=6, num_layers=3, dropout=0.0):
+        """Build prefix/date embeddings, transformer layers, and digit heads.
 
         The architecture must match the training notebook exactly so the saved
         state_dict can be loaded without the original training package.
@@ -43,8 +48,6 @@ class DateTransformerDigitMemorizer(nn.Module):
         super().__init__()
         assert d_model % nhead == 0
 
-        self.min_year = int(min_year)
-        self.max_year = int(max_year)
         self.num_dates = int(num_dates)
         self.d_model = int(d_model)
         self.model_kwargs = {
@@ -54,12 +57,9 @@ class DateTransformerDigitMemorizer(nn.Module):
             "dropout": float(dropout),
         }
 
-        n_years = self.max_year - self.min_year + 1
-        self.date_embedding = nn.Embedding(num_dates, d_model)
-        self.year_embedding = nn.Embedding(n_years, d_model)
-        self.month_embedding = nn.Embedding(13, d_model)
-        self.day_embedding = nn.Embedding(32, d_model)
-        self.field_embedding = nn.Embedding(4, d_model)
+        self.prefix_embedding = nn.Embedding(len(PREFIX_TO_ID), d_model)
+        self.date_embedding = nn.Embedding(self.num_dates, d_model)
+        self.field_embedding = nn.Embedding(2, d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -79,19 +79,17 @@ class DateTransformerDigitMemorizer(nn.Module):
         self.digit_head = nn.Linear(d_model, FIXED_DIGITS * 10)
 
     def forward(self, x):
-        """Run [date_id, yyyy_idx, mm, dd] through the model.
+        """Run [prefix_id, date_id] through the model.
 
         The returned tensor has shape [batch, 11, 10], one ten-way classifier
         for each fixed-point digit.
         """
         x = x.long()
-        date_token = self.date_embedding(x[:, 0])
-        year_token = self.year_embedding(x[:, 1])
-        month_token = self.month_embedding(x[:, 2])
-        day_token = self.day_embedding(x[:, 3])
+        prefix_token = self.prefix_embedding(x[:, 0])
+        date_token = self.date_embedding(x[:, 1])
 
-        tokens = torch.stack([date_token, year_token, month_token, day_token], dim=1)
-        field_ids = torch.arange(4, device=x.device).unsqueeze(0)
+        tokens = torch.stack([prefix_token, date_token], dim=1)
+        field_ids = torch.arange(2, device=x.device).unsqueeze(0)
         tokens = tokens + self.field_embedding(field_ids)
 
         encoded = self.encoder(tokens)
@@ -114,10 +112,7 @@ def digits_to_fixed(digits) -> int:
 
 def fixed_to_log_px(fixed: int) -> float:
     """Convert the fixed integer round(log_px * 1e10) back to log_px."""
-    fixed = int(fixed)
-    x = fixed // Y_SCALE
-    y = fixed % Y_SCALE
-    return float(x * 1e-4 + y * 1e-10)
+    return float(int(fixed) / LOG_PX_SCALE)
 
 
 def _torch_load(path, device: torch.device) -> dict[str, Any]:
@@ -141,38 +136,169 @@ def _load_payload(device: torch.device) -> dict[str, Any]:
 
 
 def _prepare_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    """Validate checkpoint metadata and cache the date-to-id map in memory."""
+    """Validate checkpoint metadata shared by the bundled predictor."""
     if int(metadata.get("fixed_digits", FIXED_DIGITS)) != FIXED_DIGITS:
         raise ValueError(f"checkpoint fixed_digits does not match {FIXED_DIGITS}")
 
-    date_index = metadata.get("date_index")
-    if not date_index:
-        raise ValueError("checkpoint metadata is missing date_index")
+    prefix_to_id = metadata.get("prefix_to_id", PREFIX_TO_ID)
+    for prefix, expected in PREFIX_TO_ID.items():
+        if int(prefix_to_id.get(prefix, expected)) != expected:
+            raise ValueError(f"checkpoint prefix id for {prefix!r} does not match {expected}")
 
+    return metadata
+
+
+def _prefix_to_id(prefix: str, metadata: dict[str, Any] | None = None) -> int:
+    """Convert P, D, or M into the checkpoint prefix id."""
+    prefix_map = PREFIX_TO_ID if metadata is None else metadata.get("prefix_to_id", PREFIX_TO_ID)
+    key = prefix.upper()
+    if key not in prefix_map:
+        raise KeyError(f"unknown prefix {prefix!r}; expected one of {sorted(prefix_map)}")
+    return int(prefix_map[key])
+
+
+def make_features_for_date_ids(
+    date_ids,
+    prefix: str = PRICE_PREFIX,
+    metadata: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    """Build feature rows shaped as [prefix_id, date_id]."""
+    prefix_id = _prefix_to_id(prefix, metadata)
+    rows = [[prefix_id, int(date_id)] for date_id in date_ids]
+    return torch.as_tensor(rows, dtype=torch.long)
+
+
+def _yyyymmdd_to_date_key(value: int) -> str:
+    """Convert integer YYYYMMDD into an ISO date string."""
+    value = int(value)
+    year = value // 10_000
+    month = (value // 100) % 100
+    day = value % 100
+    return _dt.date(year, month, day).isoformat()
+
+
+@torch.no_grad()
+def _predict_digits_for_date_ids(
+    model: DateTransformerDigitMemorizer,
+    date_ids,
+    prefix: str,
+    metadata: dict[str, Any] | None = None,
+    device: str | torch.device | None = None,
+    batch_size: int = RANGE_BATCH_SIZE,
+) -> list[list[int]]:
+    """Predict 11 output digits for explicit date_id values using one prefix."""
+    torch_device = get_device() if device is None else torch.device(device)
+    date_id_list = [int(date_id) for date_id in date_ids]
+    if not date_id_list:
+        return []
+
+    features = make_features_for_date_ids(date_id_list, prefix=prefix, metadata=metadata)
+    rows: list[list[int]] = []
+    model.eval()
+    model.to(device=torch_device, dtype=MODEL_DTYPE)
+    for start in range(0, len(features), batch_size):
+        batch = features[start : start + batch_size].to(torch_device)
+        logits = model(batch)
+        rows.extend(logits.argmax(dim=2).detach().cpu().tolist())
+    return [[int(digit) for digit in row] for row in rows]
+
+
+@torch.no_grad()
+def predict_max_date_id(
+    model: DateTransformerDigitMemorizer,
+    metadata: dict[str, Any] | None = None,
+    device: str | torch.device | None = None,
+) -> dict[str, Any]:
+    """Predict the memorized max(date_id) from the [M, 0] query."""
+    digits = _predict_digits_for_date_ids(model, [0], MAX_DATE_ID_PREFIX, metadata=metadata, device=device)[0]
+    return {
+        "prefix": MAX_DATE_ID_PREFIX,
+        "date_id": 0,
+        "pred_digits": digits,
+        "pred_max_date_id": digits_to_fixed(digits),
+    }
+
+
+@torch.no_grad()
+def predict_yyyymmdd_for_date_id(
+    model: DateTransformerDigitMemorizer,
+    date_id: int,
+    metadata: dict[str, Any] | None = None,
+    device: str | torch.device | None = None,
+) -> dict[str, Any]:
+    """Predict the memorized YYYYMMDD record for one date_id."""
+    digits = _predict_digits_for_date_ids(model, [int(date_id)], DATE_PREFIX, metadata=metadata, device=device)[0]
+    yyyymmdd = digits_to_fixed(digits)
+    return {
+        "prefix": DATE_PREFIX,
+        "date_id": int(date_id),
+        "pred_digits": digits,
+        "pred_yyyymmdd": yyyymmdd,
+        "pred_date": _yyyymmdd_to_date_key(yyyymmdd),
+    }
+
+
+@torch.no_grad()
+def construct_date_index(
+    model: DateTransformerDigitMemorizer,
+    metadata: dict[str, Any] | None = None,
+    device: str | torch.device | None = None,
+    batch_size: int = RANGE_BATCH_SIZE,
+) -> list[str]:
+    """Rebuild the frozen trading-date index by querying M, then D for all ids."""
+    torch_device = get_device() if device is None else torch.device(device)
+    max_date_id = predict_max_date_id(model, metadata=metadata, device=torch_device)["pred_max_date_id"]
+    expected_max_date_id = int(model.num_dates) - 1
+    if int(max_date_id) != expected_max_date_id:
+        raise ValueError(f"M predicted max_date_id={max_date_id}, expected {expected_max_date_id}")
+
+    date_ids = list(range(int(max_date_id) + 1))
+    digit_rows = _predict_digits_for_date_ids(
+        model,
+        date_ids,
+        DATE_PREFIX,
+        metadata=metadata,
+        device=torch_device,
+        batch_size=batch_size,
+    )
+    return [_yyyymmdd_to_date_key(digits_to_fixed(digits)) for digits in digit_rows]
+
+
+def _prepare_date_index_metadata(
+    model: DateTransformerDigitMemorizer,
+    metadata: dict[str, Any],
+    device: torch.device,
+) -> dict[str, Any]:
+    """Cache the reconstructed date index and date-to-id map in metadata."""
+    if "date_index" not in metadata:
+        metadata["date_index"] = construct_date_index(model, metadata=metadata, device=device)
     if "_date_to_id" not in metadata:
-        metadata["_date_to_id"] = {date_key: idx for idx, date_key in enumerate(date_index)}
+        metadata["_date_to_id"] = {date_key: idx for idx, date_key in enumerate(metadata["date_index"])}
+    metadata["max_date_id"] = len(metadata["date_index"]) - 1
     return metadata
 
 
 def load_model_checkpoint(device: str | torch.device | None = None):
-    """Load model weights and metadata from the bundled checkpoint.
+    """Load model weights and raw metadata from the bundled checkpoint.
 
-    Returns (model, metadata).  Only load checkpoints you trust because this uses
-    torch.load, matching normal PyTorch checkpoint behavior.
+    Date-index reconstruction is a separate step performed by ChatPX. Only load
+    checkpoints you trust because this uses torch.load, matching normal PyTorch
+    checkpoint behavior.
     """
     torch_device = get_device() if device is None else torch.device(device)
     payload = _load_payload(torch_device)
     metadata = _prepare_metadata(dict(payload["metadata"]))
+    state_dict = payload["state_dict"]
+    num_dates = int(metadata.get("num_dates", state_dict["date_embedding.weight"].shape[0]))
 
     model = DateTransformerDigitMemorizer(
-        metadata["min_year"],
-        metadata["max_year"],
-        metadata["num_dates"],
+        num_dates,
         **metadata.get("model_kwargs", {}),
     )
-    model.load_state_dict(payload["state_dict"])
+    model.load_state_dict(state_dict)
     model.to(device=torch_device, dtype=MODEL_DTYPE)
     model.eval()
+    metadata["num_dates"] = num_dates
     return model, metadata
 
 
@@ -208,8 +334,10 @@ def _date_key(date_or_year, month=None, day=None) -> str:
 
 
 def make_feature_for_date(date_or_year, metadata: dict[str, Any], month=None, day=None) -> torch.Tensor:
-    """Turn one frozen trading date into [date_id, yyyy_idx, mm, dd]."""
+    """Turn one frozen trading date into [P, date_id]."""
     metadata = _prepare_metadata(metadata)
+    if "_date_to_id" not in metadata:
+        raise ValueError("metadata has no reconstructed date index; ChatPX prepares it during initialization")
     date_key = _date_key(date_or_year, month, day)
     date_to_id = metadata["_date_to_id"]
     if date_key not in date_to_id:
@@ -217,15 +345,13 @@ def make_feature_for_date(date_or_year, metadata: dict[str, Any], month=None, da
         last_date = metadata["date_index"][-1]
         raise KeyError(f"{date_key} is not in the frozen trading-date index {first_date}..{last_date}")
 
-    parsed = _dt.date.fromisoformat(date_key)
-    return torch.as_tensor(
-        [[date_to_id[date_key], parsed.year - int(metadata["min_year"]), parsed.month, parsed.day]],
-        dtype=torch.long,
-    )
+    return make_features_for_date_ids([date_to_id[date_key]], prefix=PRICE_PREFIX, metadata=metadata)
 
 
 def _date_range_keys(start_date, end_date, metadata: dict[str, Any]) -> list[str]:
     """Return frozen trading-date keys between start_date and end_date, inclusive."""
+    if "date_index" not in metadata:
+        raise ValueError("metadata has no reconstructed date index; ChatPX prepares it during initialization")
     start_key = _date_key(start_date)
     end_key = _date_key(end_date)
     if start_key > end_key:
@@ -236,13 +362,10 @@ def _date_range_keys(start_date, end_date, metadata: dict[str, Any]) -> list[str
 def _make_features_for_date_keys(date_keys: list[str], metadata: dict[str, Any]) -> torch.Tensor:
     """Turn ordered date keys into model feature rows."""
     metadata = _prepare_metadata(metadata)
-    min_year = int(metadata["min_year"])
+    if "_date_to_id" not in metadata:
+        raise ValueError("metadata has no reconstructed date index; ChatPX prepares it during initialization")
     date_to_id = metadata["_date_to_id"]
-    rows = []
-    for date_key in date_keys:
-        parsed = _dt.date.fromisoformat(date_key)
-        rows.append([date_to_id[date_key], parsed.year - min_year, parsed.month, parsed.day])
-    return torch.as_tensor(rows, dtype=torch.long)
+    return make_features_for_date_ids([date_to_id[date_key] for date_key in date_keys], prefix=PRICE_PREFIX, metadata=metadata)
 
 
 @torch.no_grad()
@@ -269,14 +392,12 @@ def predict_log_px_for_date(
 
     return {
         "date": date_key,
-        "date_id": int(x.detach().cpu()[0, 0].item()),
+        "date_id": int(x.detach().cpu()[0, 1].item()),
         "yyyy": parsed.year,
         "mm": parsed.month,
         "dd": parsed.day,
         "pred_digits": digits,
         "pred_log_px_fixed": fixed,
-        "pred_log_px_x": int(fixed // Y_SCALE),
-        "pred_log_px_y": int(fixed % Y_SCALE),
         "pred_log_px": log_px,
         "pred_px": float(math.exp(log_px)),
     }
@@ -290,9 +411,10 @@ class ChatPX:
     """
 
     def __init__(self, device: str | torch.device | None = None):
-        """Load the internal model checkpoint onto the requested Torch device."""
+        """Load the checkpoint, then reconstruct the date index from the model."""
         self.device = get_device() if device is None else torch.device(device)
         self.model, self.metadata = load_model_checkpoint(self.device)
+        _prepare_date_index_metadata(self.model, self.metadata, self.device)
 
     def predict(self, date_or_year, month=None, day=None) -> dict[str, Any]:
         """Return the full predicted record for one trading date."""

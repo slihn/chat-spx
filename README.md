@@ -3,8 +3,14 @@
 This small AI package is a chat engine. You send it a date, it tells you the SPX Close on that date.
 
 This package is based on a PyTorch transformer model and is predict-only.
-The bundled data contains the model weights and the trading-date index from `5/26/1896` to `5/29/2026`.
-Before `12/30/1927`, the training data is rescaled from the Industrial close.
+The bundled data contains the model weights for frozen trading dates from `5/26/1896` to `5/29/2026`.
+Before `12/30/1927`, the closing price is rescaled from the Industrial index.
+
+Internally, the transformer memorizes three prefix tasks:
+`M -> max(date_id)`,
+`D -> YYYYMMDD`, which rebuilds the `date_id -> YYYY-MM-DD` index at load time,
+and `P -> log_px_fixed`, which reconstructs `log_px` and then `px`.
+This structure requires only minimal metadata outside of the model.
 
 Disclaimer: There is no guarantee of data precision since the AI model is prone to error. Use at your own risk.
 
@@ -88,6 +94,8 @@ chat-spx --range 2026-05-18 2026-05-21
 - `get_log_px(date)` returns the memorized fixed-point `log_px` value.
 - `predict(date)` returns the date id, predicted digits, fixed integer, `log_px`,
   and `px`.
+- The checkpoint uses prefix queries: `P -> log_px_fixed`, `D -> YYYYMMDD`,
+  and `M -> max(date_id)`.
 - The date must be in the frozen trading-date index.  Weekends, holidays,
   and dates after `5/29/2026` raise `KeyError`.
 
@@ -113,4 +121,4 @@ python -m twine upload dist/*
 ```
 
 The package includes the model weights, so the distribution is much
-larger than a typical pure-Python package. It is about 46MB.
+larger than a typical pure-Python package. It is about 21MB.
